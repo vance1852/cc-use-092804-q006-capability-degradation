@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
+from .degradation_service import DegradationService
 from .errors import SupplyError, ValidationFailed
 from .service import SupplyService
 from .storage import connect
@@ -22,8 +24,9 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
+    def __init__(self, service: SupplyService, degradation: DegradationService | None = None) -> None:
         self.service = service
+        self.degradation = degradation
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -85,14 +88,53 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            if self.degradation is not None and parts and parts[0] == "degradation":
+                return self._degradation(method, parts, actor, payload)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
+    def _degradation(self, method: str, parts: list[str], actor: str, payload: dict[str, Any]) -> Response:
+        service = self.degradation
+        assert service is not None
+        if method == "POST" and parts == ["degradation", "robots"]:
+            return Response(201, service.register_robot(actor, payload))
+        if method == "POST" and parts == ["degradation", "resources"]:
+            return Response(201, service.register_resource(actor, payload))
+        if method == "GET" and parts == ["degradation", "board"]:
+            return Response(200, service.fleet_board(actor))
+        if len(parts) == 4 and parts[:2] == ["degradation", "robots"]:
+            robot_id, action = parts[2], parts[3]
+            if method == "POST" and action == "components":
+                return Response(201, service.register_component(actor, robot_id, payload))
+            if method == "POST" and action == "chains":
+                return Response(201, service.register_chain(actor, robot_id, payload))
+            if method == "POST" and action == "task":
+                return Response(201, service.set_task(actor, robot_id, payload))
+            if method == "POST" and action == "health":
+                return Response(201, service.report_health(actor, robot_id, payload))
+            if method == "POST" and action == "plans":
+                return Response(201, service.propose_plan(
+                    actor, robot_id, payload["plan_id"], payload.get("purpose", "degrade")
+                ))
+            if method == "GET" and action == "status":
+                return Response(200, service.robot_status(actor, robot_id))
+        if len(parts) == 4 and parts[:2] == ["degradation", "plans"]:
+            plan_id, action = parts[2], parts[3]
+            if method == "POST" and action == "confirm":
+                return Response(200, service.confirm_plan(actor, plan_id, int(payload["expected_revision"])))
+            if method == "POST" and action == "receipts":
+                return Response(201, service.submit_receipt(actor, plan_id, payload))
+        if method == "POST" and len(parts) == 4 and parts[:2] == ["degradation", "actions"] and parts[3] == "complete":
+            return Response(200, service.complete_manual_action(actor, parts[2], payload.get("note", "")))
+        return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
+
 
 def make_handler(application: JsonApplication):
+    dispatch_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "PowerDispatch/1"
 
@@ -105,7 +147,8 @@ def make_handler(application: JsonApplication):
         def _dispatch(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
-            response = application.handle(self.command, self.path, dict(self.headers.items()), body)
+            with dispatch_lock:
+                response = application.handle(self.command, self.path, dict(self.headers.items()), body)
             encoded = json.dumps(response.body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(response.status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -126,7 +169,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
     connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    application = JsonApplication(SupplyService(connection), DegradationService(connection))
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(application))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
