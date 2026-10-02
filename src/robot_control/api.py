@@ -85,6 +85,22 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            if method == "POST" and path == "/health/snapshots":
+                return Response(201, self.service.record_health(actor, payload))
+            if method == "POST" and path == "/degradation/plans":
+                return Response(201, self.service.freeze_plan(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["degradation", "plans"]:
+                return Response(200, self.service.get_plan(parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["degradation", "plans"] and parts[3] == "confirm":
+                return Response(200, self.service.confirm_plan(actor, parts[2], int(payload["expected_version"])))
+            if method == "POST" and len(parts) == 5 and parts[:2] == ["degradation", "plans"] and parts[3] == "manual-actions":
+                return Response(200, self.service.complete_manual_action(actor, parts[2], parts[4], payload["evidence"]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["degradation", "plans"] and parts[3] == "receipts":
+                return Response(201, self.service.register_receipt(actor, parts[2], payload))
+            if method == "GET" and path == "/degradation/board":
+                return Response(200, self.service.degradation_board(actor))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["degradation", "robots"]:
+                return Response(200, self.service.robot_degradation(parts[2]))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})

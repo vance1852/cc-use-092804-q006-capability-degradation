@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS supply_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','operator')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -194,11 +194,98 @@ CREATE TABLE IF NOT EXISTS supply_audit_events (
 
 CREATE INDEX IF NOT EXISTS idx_supply_audit_entity
 ON supply_audit_events(entity_type, entity_id, event_id);
+
+CREATE TABLE IF NOT EXISTS health_snapshots (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT,
+    robot_id TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_snapshots_robot
+ON health_snapshots(robot_id, revision);
+
+CREATE TABLE IF NOT EXISTS degradation_plans (
+    plan_id TEXT PRIMARY KEY,
+    robot_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft'
+        CHECK(state IN ('draft','confirmed','executing','safe_stopped','completed','superseded','invalidated')),
+    health_revision INTEGER NOT NULL REFERENCES health_snapshots(revision),
+    content_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    conclusion TEXT NOT NULL CHECK(conclusion IN ('continue','restricted','wait_human','safe_stop')),
+    decision_rule TEXT NOT NULL,
+    selected_chain_id TEXT,
+    restrictions_json TEXT NOT NULL,
+    missing_json TEXT NOT NULL,
+    impaired_json TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    reported_phase TEXT CHECK(reported_phase IN ('normal','degraded','safe_stop')),
+    last_receipt_at TEXT,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    UNIQUE(robot_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_degradation_plans_robot
+ON degradation_plans(robot_id, version);
+
+-- 每台机器人至多有一个尚未终态的活跃计划
+CREATE UNIQUE INDEX IF NOT EXISTS idx_degradation_active_robot
+ON degradation_plans(robot_id) WHERE state IN ('confirmed','executing');
+
+CREATE TABLE IF NOT EXISTS plan_locked_resources (
+    plan_id TEXT NOT NULL REFERENCES degradation_plans(plan_id),
+    robot_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'locked' CHECK(state IN ('locked','released')),
+    locked_at TEXT NOT NULL,
+    released_at TEXT,
+    PRIMARY KEY(plan_id, resource_id)
+);
+
+-- 一个控制资源在任意时刻只能被一个计划原子持有
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_locked_resource_active
+ON plan_locked_resources(resource_id) WHERE state='locked';
+
+CREATE TABLE IF NOT EXISTS plan_manual_actions (
+    plan_id TEXT NOT NULL REFERENCES degradation_plans(plan_id),
+    action_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    compensates_capability TEXT,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','completed')),
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    completed_by TEXT,
+    completed_at TEXT,
+    PRIMARY KEY(plan_id, action_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_receipts (
+    plan_id TEXT NOT NULL REFERENCES degradation_plans(plan_id),
+    receipt_id TEXT NOT NULL,
+    robot_id TEXT NOT NULL,
+    reported_state TEXT NOT NULL CHECK(reported_state IN ('normal','degraded','safe_stop')),
+    observed_at TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    applied INTEGER NOT NULL CHECK(applied IN (0,1)),
+    ignored_reason TEXT,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(plan_id, receipt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_receipts_robot_time
+ON plan_receipts(robot_id, observed_at);
 """
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
